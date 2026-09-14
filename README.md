@@ -24,7 +24,7 @@ This integration speaks the Baichuan binary protocol directly from Home Assistan
 ## Features
 
 * Native `HomeAssistantView` HTTP and WebSocket endpoints, registered on HA's own web server.
-* IMA/DVI-4 ADPCM encoding in Python, matched to whatever the camera advertises in `TalkAbility` (`length_per_encoder`, sample rate).
+* Stateful IMA/DVI-4 ADPCM encoding in Python, matched to whatever the camera advertises in `TalkAbility` (`length_per_encoder`, sample rate).
 * Config flow setup through the UI. No YAML, no IP addresses, no channel numbers to hand-edit.
 * One `media_player` entity per camera channel for TTS and file playback.
 * A Lovelace element, `reolink-talk-button`, served by the integration and registered as a Lovelace resource automatically. No manual file copying, no resource to add by hand.
@@ -117,7 +117,7 @@ Talk sessions are negotiated over these Baichuan command IDs:
 
 ### Audio path
 
-Audio is encoded as IMA/DVI-4 ADPCM in blocks sized from the camera's advertised `length_per_encoder`, then wrapped in Reolink's `BcMedia` framing (`bw10` magic plus a block-size header) and sent as `202` payloads.
+Audio is encoded as stateful IMA/DVI-4 ADPCM in full blocks sized from the camera's advertised `length_per_encoder`, then wrapped in the Reolink SDK's `01wb` talk-stream framing and sent as `202` payloads.
 
 For live talk, the browser captures mic audio via `getUserMedia` and `AudioContext`, downsamples to 16 kHz mono PCM16, and streams it over a WebSocket to `/api/reolink_talk/live_ws`. That endpoint encodes each block to ADPCM and forwards it to the camera as it arrives.
 

@@ -33,6 +33,28 @@ class ReolinkTarget:
     channel: int
 
 
+def _channels_from_official_runtime(re_entry: ConfigEntry) -> dict[int, str]:
+    """Read channel names from HA's already-loaded Reolink integration.
+
+    The official integration has already authenticated to the device and
+    populated its runtime host. Reusing that runtime avoids a second HTTPS
+    probe, which can fail on NVRs that use a self-signed certificate.
+    """
+    runtime_data = getattr(re_entry, "runtime_data", None)
+    runtime_host = getattr(runtime_data, "host", None)
+    api = getattr(runtime_host, "api", None)
+    if api is None:
+        return {}
+
+    channels: dict[int, str] = {}
+    for channel in sorted(getattr(api, "channels", ()) or ()):
+        try:
+            channels[channel] = api.camera_name(channel) or f"Channel {channel}"
+        except Exception:
+            channels[channel] = f"Channel {channel}"
+    return channels
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     from homeassistant.helpers.aiohttp_client import async_get_clientsession
     from reolink_aio.api import Host
@@ -60,29 +82,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         except KeyError:
             continue
 
-        channels: dict[int, str] = {}
-        try:
-            probe_host = Host(
-                host=base_kwargs["host"],
-                username=base_kwargs["username"],
-                password=base_kwargs["password"],
-                port=base_kwargs["http_port"],
-                use_https=base_kwargs["use_https"],
-                bc_port=base_kwargs["port"],
-                aiohttp_get_session_callback=lambda: async_get_clientsession(hass),
+        channels = _channels_from_official_runtime(re_entry)
+        if channels:
+            _LOGGER.debug(
+                "Discovered %s Reolink channel(s) for %s from the official integration runtime",
+                len(channels),
+                reolink_entry_id,
             )
-            await probe_host.get_host_data()
-            for ch in probe_host.channels:
-                try:
-                    channels[ch] = probe_host.camera_name(ch) or f"Channel {ch}"
-                except Exception:
-                    channels[ch] = f"Channel {ch}"
+        else:
+            # Compatibility fallback for older HA/Reolink versions where the
+            # official runtime does not expose its normalized API object.
             try:
-                await probe_host.logout()
-            except Exception:
-                pass
-        except Exception:
-            _LOGGER.debug("Could not enumerate channels for %s, falling back to single channel", reolink_entry_id)
+                probe_host = Host(
+                    host=base_kwargs["host"],
+                    username=base_kwargs["username"],
+                    password=base_kwargs["password"],
+                    port=base_kwargs["http_port"],
+                    use_https=base_kwargs["use_https"],
+                    bc_port=base_kwargs["port"],
+                    aiohttp_get_session_callback=lambda: async_get_clientsession(hass),
+                )
+                await probe_host.get_host_data()
+                for ch in probe_host.channels:
+                    try:
+                        channels[ch] = probe_host.camera_name(ch) or f"Channel {ch}"
+                    except Exception:
+                        channels[ch] = f"Channel {ch}"
+                try:
+                    await probe_host.logout()
+                except Exception:
+                    pass
+            except Exception as err:
+                _LOGGER.warning(
+                    "Could not enumerate channels for %s, falling back to channel %s: %s",
+                    reolink_entry_id,
+                    default_channel,
+                    err,
+                )
 
         if not channels:
             channels = {default_channel: re_entry.title or reolink_entry_id}

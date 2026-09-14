@@ -223,8 +223,7 @@ class ReolinkTalkLiveWebSocketView(HomeAssistantView):
 
             full_block = (int(ability.length_per_encoder) // 2) + 4
             payload_bytes = full_block - 4
-            payload_samples = payload_bytes * 2
-            samples_per_block = payload_samples + 1  # +1 implied header sample
+            samples_per_block = payload_bytes * 2
             bytes_per_block_pcm = samples_per_block * 2  # s16le -> 2 bytes/sample
 
             _LOGGER.info(
@@ -269,6 +268,7 @@ class ReolinkTalkLiveWebSocketView(HomeAssistantView):
             await ws.send_json({"status": "ready", "sampleRate": ability.sample_rate})
 
             pcm_buffer = bytearray()
+            stream_block_number = 0
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
                     pcm_buffer += msg.data
@@ -278,8 +278,14 @@ class ReolinkTalkLiveWebSocketView(HomeAssistantView):
                         adpcm_block = ima_adpcm_encode_dvi_blocks(chunk, full_block_size=full_block)
                         if not adpcm_block:
                             continue
-                        for payload, _n in talk_binary_payload(adpcm_block, full_block, blocks_per_payload=1):
+                        for payload, _n in talk_binary_payload(
+                            adpcm_block,
+                            full_block,
+                            blocks_per_payload=1,
+                            block_number_start=stream_block_number,
+                        ):
                             await send_talk_binary(bc, channel, payload, enc_type=enc_used)
+                            stream_block_number += 1
                 elif msg.type == WSMsgType.ERROR:
                     _LOGGER.warning("Live talk WS error: %s", ws.exception())
                     break

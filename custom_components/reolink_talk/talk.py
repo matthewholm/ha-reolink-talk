@@ -184,36 +184,52 @@ def extract_wav_fmt_and_data(wav: bytes) -> tuple[dict, bytes]:
     return fmt, data
 
 
-def bcmedia_adpcm_packet(block: bytes) -> bytes:
-    # Port of neolink bcmedia_adpcm() + padding rules.
-    # block must be: 4 bytes predictor state + N bytes adpcm payload.
+def bcmedia_adpcm_packet(block: bytes, *, block_number: int) -> bytes:
+    """Build the SDK's ``01wb`` ADPCM chunk.
+
+    Reolink calls this a BcMedia stream, but the talk stream accepted by the
+    NVR uses the SDK's ``01wb`` variant rather than the older ``bw10`` wrapper.
+    The cumulative field is a byte count, not the ADPCM payload size.
+    """
     if len(block) < 5:
         raise ValueError("ADPCM block too small")
-    payload_len = len(block) + 4  # + magic u16 + blocksize u16
-    # Neolink format: "block size without header, halved" (DVI-4 payload bytes / 2).
-    block_size = ((len(block) - 4) // 2)
-    header = struct.pack(
-        "<IHHHH",
-        0x62773130,  # MAGIC_HEADER_BCMEDIA_ADPCM
-        payload_len,
-        payload_len,
-        0x0100,  # MAGIC_HEADER_BCMEDIA_ADPCM_DATA
-        block_size,
+
+    adpcm_payload = block[4:]
+    predictor, index = struct.unpack_from("<hB", block, 0)
+    chunk_len = len(adpcm_payload) + 8
+    cumulative = ((block_number + 1) * chunk_len) & 0xFFFF
+    return (
+        b"01wb"
+        + struct.pack("<HH", chunk_len, cumulative)
+        + bytes((0x00, 0x01, 0x00, 0x00))
+        + struct.pack("<hH", predictor, index)
+        + adpcm_payload
     )
-    pad_len = (-len(block)) % 8
-    return header + block + (b"\x00" * pad_len)
 
 
-def talk_binary_payload(adpcm_bytes: bytes, full_block_size: int, blocks_per_payload: int = 4) -> list[tuple[bytes, int]]:
-    # Returns list of (binary_payload, blocks_in_payload).
+def talk_binary_payload(
+    adpcm_bytes: bytes,
+    full_block_size: int,
+    blocks_per_payload: int = 4,
+    *,
+    block_number_start: int = 0,
+) -> list[tuple[bytes, int]]:
+    """Return ``(payload, block_count)`` chunks for the SDK talk stream."""
+    if blocks_per_payload < 1:
+        raise ValueError("blocks_per_payload must be positive")
+
     out: list[tuple[bytes, int]] = []
     blocks = [adpcm_bytes[i : i + full_block_size] for i in range(0, len(adpcm_bytes), full_block_size)]
-    # Drop incomplete trailing block (if any)
+    # The encoder always emits complete blocks. Do not send a malformed tail
+    # if this helper is called with externally-produced ADPCM.
     if blocks and len(blocks[-1]) != full_block_size:
         blocks = blocks[:-1]
     for i in range(0, len(blocks), blocks_per_payload):
         group = blocks[i : i + blocks_per_payload]
-        payload = b"".join(bcmedia_adpcm_packet(b) for b in group)
+        payload = b"".join(
+            bcmedia_adpcm_packet(block, block_number=block_number_start + i + offset)
+            for offset, block in enumerate(group)
+        )
         out.append((payload, len(group)))
     return out
 
@@ -474,11 +490,16 @@ def _ima_encode_nibble(sample: int, predictor: int, step_index: int) -> tuple[in
 def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> bytes:
     """Encode PCM s16le into DVI-4 ADPCM blocks.
 
-    Block layout expected by neolink talk:
-    - 2 bytes: initial predictor sample (i16 LE)
-    - 1 byte: step index
+    Block layout expected by the Reolink SDK talk stream:
+    - 2 bytes: predictor state before this block (i16 LE)
+    - 1 byte: step index before this block
     - 1 byte: reserved (0)
-    - (full_block_size - 4) bytes: packed nibbles, 2 samples per byte
+    - (full_block_size - 4) bytes: packed nibbles, first nibble high
+
+    ``lengthPerEncoder`` is the number of PCM samples in a block. The four
+    state bytes are metadata, so a 1024-sample block has 512 ADPCM bytes.
+    Keeping the predictor/index state across blocks is important: resetting it
+    at every network packet produces intelligible but distinctly choppy audio.
     """
     if full_block_size < 8:
         raise ValueError("full_block_size too small")
@@ -486,7 +507,7 @@ def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> by
         raise ValueError("PCM length must be even (s16le)")
 
     payload_bytes = full_block_size - 4
-    payload_samples = payload_bytes * 2
+    samples_per_block = payload_bytes * 2
 
     # Convert pcm bytes to list of i16
     sample_count = len(pcm_s16le) // 2
@@ -494,38 +515,32 @@ def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> by
     if not samples:
         return b""
 
-    # Streaming-style: each block header contains the current predictor + index
-    # (the "last output" state), followed by payload_samples ADPCM-coded samples.
-    predictor = int(samples[0])
-    step_index = 0
-    pos = 1  # first sample is used as initial predictor
-
+    total_blocks = (len(samples) + samples_per_block - 1) // samples_per_block
     out = bytearray()
-    while pos <= len(samples):
-        block = bytearray()
-        block += struct.pack("<hBB", predictor, step_index, 0)
+    predictor = 0
+    step_index = 0
+    sample_offset = 0
 
-        nibble_acc = None
-        # Encode a fixed number of samples per block.
-        for _ in range(payload_samples):
-            s = int(samples[pos]) if pos < len(samples) else 0
-            pos += 1
-            nib, predictor, step_index = _ima_encode_nibble(s, predictor, step_index)
-            if nibble_acc is None:
-                nibble_acc = nib
-            else:
-                block.append((nibble_acc & 0xF) | ((nib & 0xF) << 4))
-                nibble_acc = None
-        if nibble_acc is not None:
-            block.append(nibble_acc & 0xF)
+    for _ in range(total_blocks):
+        remaining = min(samples_per_block, len(samples) - sample_offset)
+        block_samples = list(samples[sample_offset : sample_offset + remaining])
+        block_samples.extend([0] * (samples_per_block - remaining))
 
-        if len(block) < full_block_size:
-            block.extend(b"\x00" * (full_block_size - len(block)))
-        out += block[:full_block_size]
+        state_before_predictor = predictor
+        state_before_index = step_index
+        encoded = bytearray()
+        for sample_offset_in_block in range(0, samples_per_block, 2):
+            first, predictor, step_index = _ima_encode_nibble(
+                int(block_samples[sample_offset_in_block]), predictor, step_index
+            )
+            second, predictor, step_index = _ima_encode_nibble(
+                int(block_samples[sample_offset_in_block + 1]), predictor, step_index
+            )
+            encoded.append(((first & 0xF) << 4) | (second & 0xF))
 
-        # Stop once we've consumed all input samples and emitted at least one block.
-        if pos >= len(samples):
-            break
+        out += struct.pack("<hBB", state_before_predictor, state_before_index, 0)
+        out += encoded
+        sample_offset += remaining
 
     return bytes(out)
 
@@ -539,11 +554,10 @@ async def send_talk_binary(
     enc_type=None,
 ) -> None:
     # Like reolink_aio Baichuan.send(), but:
-    # - doesn't wait for a response
+    # - doesn't wait for a response (stream packets are fire-and-forget)
     # - encrypts only the Extension XML
     # - appends the BcMedia binary payload unencrypted
     from reolink_aio.baichuan import util as bc_util
-    from reolink_aio.baichuan import xmls
 
     if not getattr(bc, "_logged_in", False):
         await bc.login()
@@ -557,8 +571,7 @@ async def send_talk_binary(
     ch_id = channel + 1
 
     ext = (
-        xmls.XML_HEADER
-        + '<Extension version="1.1">\n'
+        '<Extension version="1.1">\n'
         + "<binaryData>1</binaryData>\n"
         + f"<channelId>{channel}</channelId>\n"
         + "</Extension>\n"
@@ -618,35 +631,9 @@ async def send_talk_binary(
             payload_offset,
         )
 
-    # Wait for the camera ack like neolink does (it subscribes to MSG_ID_TALK and awaits recv).
-    # Without this, some firmwares may silently drop packets under load.
     await bc._connect_if_needed()
-    proto = getattr(bc, "_protocol", None)
-    loop = getattr(bc, "_loop", None)
-    if proto is None or loop is None:
-        async with bc._login_mutex:
-            bc._connection._transport.write(packet)
-        return
-
-    full_mess_id = int.from_bytes(int(ch_id).to_bytes(1, "little") + int(bc._mess_id).to_bytes(3, "little"), "little")
-    receive_future = loop.create_future()
-    proto.receive_futures.setdefault(cmd_id, {})[full_mess_id] = receive_future
-
-    try:
-        async with bc._login_mutex:
-            bc._connection._transport.write(packet)
-        async with asyncio.timeout(5):
-            await receive_future
-    finally:
-        try:
-            if not receive_future.done():
-                receive_future.cancel()
-        except Exception:
-            pass
-        futs = proto.receive_futures.get(cmd_id, {})
-        futs.pop(full_mess_id, None)
-        if not futs and cmd_id in proto.receive_futures:
-            proto.receive_futures.pop(cmd_id, None)
+    async with bc._login_mutex:
+        bc._connection._transport.write(packet)
 
 
 async def talk_playback(
@@ -739,21 +726,28 @@ async def talk_playback(
         else:
             raise
 
-    # `lengthPerEncoder` in TalkAbility is not consistently documented across
-    # models/firmware. In practice, the WAV `block_align` coming out of ffmpeg is
-    # the most reliable "bytes per ADPCM block" value for chunking and pacing.
-    full_block_size = int(block_align or ability.length_per_encoder)
-    payloads = talk_binary_payload(adpcm_bytes, full_block_size, blocks_per_payload=4)
+    # `block_align` is the on-wire ADPCM block size (4 state bytes + encoded
+    # payload). The NVR advertises 1024 PCM samples, which is 516 bytes here.
+    full_block_size = int(block_align or (ability.length_per_encoder // 2) + 4)
+    # One complete SDK stream block per Baichuan payload keeps framing and
+    # pacing unambiguous.
+    payloads = talk_binary_payload(adpcm_bytes, full_block_size, blocks_per_payload=1)
 
     try:
+        loop = asyncio.get_running_loop()
+        next_deadline = loop.time()
+        block_duration = ability.length_per_encoder / float(ability.sample_rate)
+        blocks_sent = 0
         for payload, blocks_in_payload in payloads:
             await send_talk_binary(bc, channel, payload, enc_type=enc_used)
+            blocks_sent += blocks_in_payload
+            next_deadline += block_duration * blocks_in_payload
+            await asyncio.sleep(max(0.0, next_deadline - loop.time()))
 
-            # Pace like neolink: sleep for the playback time of the data we just sent.
-            adpcm_len = full_block_size * blocks_in_payload
-            samples_sent = (adpcm_len - 4 * blocks_in_payload) * 2 + blocks_in_payload
-            play_length = samples_sent / float(ability.sample_rate)
-            await asyncio.sleep(play_length)
+        # Let the NVR's speaker queue drain before closing, especially for the
+        # final TTS block.
+        if blocks_sent:
+            await asyncio.sleep(0.3)
     finally:
         try:
             await bc.send(cmd_id=11, channel=channel, enc_type=enc_used)
