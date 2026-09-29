@@ -77,7 +77,7 @@ class LiveEncoderTest(unittest.TestCase):
         pcm = sine(16000 * 2)
         a = self.encode_stream(pcm, 4096)
         b = self.encode_stream(pcm, 333)
-        self.assertEqual(a, b[: len(a)] if len(b) >= len(a) else b)
+        self.assertEqual(a, b)
 
     def test_step_index_carried_between_blocks(self):
         blocks = self.encode_stream(sine(16000), 4096)
