@@ -37,8 +37,8 @@ from homeassistant.util import slugify
 
 from .const import DOMAIN
 from .talk import (
+    LiveAdpcmEncoder,
     build_talk_config_variants,
-    ima_adpcm_encode_dvi_blocks,
     parse_talk_ability,
     send_talk_binary,
     talk_binary_payload,
@@ -268,16 +268,27 @@ class ReolinkTalkLiveWebSocketView(HomeAssistantView):
             _LOGGER.info("Live talk session started: camera=%s channel=%s enc=%s", camera, channel, enc_used.value)
             await ws.send_json({"status": "ready", "sampleRate": ability.sample_rate})
 
-            pcm_buffer = bytearray()
+            encoder = LiveAdpcmEncoder(full_block)
+            # Pacing probe: audio seconds received against wall-clock seconds.
+            # A ratio that climbs over 1.0 during a long hold means the client
+            # delivers faster than real time (or in bursts) and the camera's
+            # jitter buffer is filling, which sounds like progressive warping.
+            rate = max(int(ability.sample_rate), 1)
+            t0 = time.monotonic()
+            pcm_bytes_in = 0
+            next_report = t0 + 5.0
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
-                    pcm_buffer += msg.data
-                    while len(pcm_buffer) >= bytes_per_block_pcm:
-                        chunk = bytes(pcm_buffer[:bytes_per_block_pcm])
-                        del pcm_buffer[:bytes_per_block_pcm]
-                        adpcm_block = ima_adpcm_encode_dvi_blocks(chunk, full_block_size=full_block)
-                        if not adpcm_block:
-                            continue
+                    pcm_bytes_in += len(msg.data)
+                    now = time.monotonic()
+                    if now >= next_report:
+                        next_report = now + 5.0
+                        _LOGGER.debug(
+                            "Live talk pacing: camera=%s audio=%.2fs wall=%.2fs ratio=%.3f",
+                            camera, pcm_bytes_in / 2 / rate, now - t0,
+                            (pcm_bytes_in / 2 / rate) / max(now - t0, 1e-6),
+                        )
+                    for adpcm_block in encoder.feed(msg.data):
                         for payload, _n in talk_binary_payload(adpcm_block, full_block, blocks_per_payload=1):
                             await send_talk_binary(bc, channel, payload, enc_type=enc_used)
                 elif msg.type == WSMsgType.ERROR:
@@ -286,7 +297,12 @@ class ReolinkTalkLiveWebSocketView(HomeAssistantView):
                 # TEXT control messages are ignored; the browser closing the
                 # socket is what ends the loop.
 
-            _LOGGER.info("Live talk disconnected: camera=%s channel=%s", camera, channel)
+            wall = time.monotonic() - t0
+            _LOGGER.info(
+                "Live talk disconnected: camera=%s channel=%s audio=%.2fs wall=%.2fs ratio=%.3f",
+                camera, channel, pcm_bytes_in / 2 / rate, wall,
+                (pcm_bytes_in / 2 / rate) / max(wall, 1e-6),
+            )
         except Exception:
             _LOGGER.exception("Live talk relay error (camera=%s)", camera)
         finally:

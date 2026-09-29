@@ -530,6 +530,62 @@ def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> by
     return bytes(out)
 
 
+class LiveAdpcmEncoder:
+    """Streaming DVI-4 encoder that carries predictor and step index across blocks.
+
+    ima_adpcm_encode_dvi_blocks() restarts from step_index 0 and spends one
+    input sample as the header predictor on every call. Called once per block
+    (as the live relay does) that resets the codec every few hundred
+    milliseconds. Here only the very first block consumes a sample as the
+    initial predictor; every later block header carries the running state, so
+    the camera's decoder stays in step with the encoder for the whole hold.
+    """
+
+    def __init__(self, full_block_size: int) -> None:
+        if full_block_size < 8:
+            raise ValueError("full_block_size too small")
+        self.full_block_size = full_block_size
+        self.payload_samples = (full_block_size - 4) * 2
+        self._predictor = 0
+        self._step_index = 0
+        self._primed = False
+        self._pending: list[int] = []
+
+    def feed(self, pcm_s16le: bytes) -> list[bytes]:
+        """Add PCM (s16le, any length) and return every block that is now complete."""
+        usable = len(pcm_s16le) - (len(pcm_s16le) % 2)
+        if usable:
+            self._pending.extend(struct.unpack("<" + "h" * (usable // 2), pcm_s16le[:usable]))
+        blocks: list[bytes] = []
+        while True:
+            if not self._primed:
+                if len(self._pending) < self.payload_samples + 1:
+                    break
+                self._predictor = self._pending.pop(0)
+                self._step_index = 0
+                self._primed = True
+            if len(self._pending) < self.payload_samples:
+                break
+            samples = self._pending[: self.payload_samples]
+            del self._pending[: self.payload_samples]
+            blocks.append(self._encode_block(samples))
+        return blocks
+
+    def _encode_block(self, samples: list[int]) -> bytes:
+        block = bytearray(struct.pack("<hBB", self._predictor, self._step_index, 0))
+        acc = None
+        for s in samples:
+            nib, self._predictor, self._step_index = _ima_encode_nibble(
+                s, self._predictor, self._step_index
+            )
+            if acc is None:
+                acc = nib
+            else:
+                block.append((acc & 0xF) | ((nib & 0xF) << 4))
+                acc = None
+        return bytes(block)
+
+
 async def send_talk_binary(
     bc,  # reolink_aio.baichuan.Baichuan
     channel: int,
