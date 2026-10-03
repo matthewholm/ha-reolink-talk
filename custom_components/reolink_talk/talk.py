@@ -613,7 +613,7 @@ async def send_talk_binary(
     ch_id = channel + 1
 
     ext = (
-        xmls.XML_HEADER
+        '<?xml version="1.0" encoding="UTF-8" ?>\n'
         + '<Extension version="1.1">\n'
         + "<binaryData>1</binaryData>\n"
         + f"<channelId>{channel}</channelId>\n"
