@@ -144,5 +144,20 @@ class LiveSessionEndTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self._wait_for_stop(3))
 
 
+
+class ClientErrorTest(unittest.TestCase):
+    def test_client_error_lands_in_the_diagnostic_sensor(self):
+        states, results = {}, []
+        hass = types.SimpleNamespace(states=types.SimpleNamespace(
+            async_set=lambda eid, state, attrs: states.__setitem__(eid, (state, attrs))))
+        conn = types.SimpleNamespace(send_result=lambda mid, *a: results.append(mid))
+        view_mod.ws_client_error(hass, conn, {"id": 7, "camera": "front_door",
+                                              "message": "mic error - NotAllowedError: denied",
+                                              "context": "secure=true"})
+        state, attrs = states[view_mod.CLIENT_ERROR_ENTITY]
+        self.assertEqual(state, "mic error - NotAllowedError: denied")
+        self.assertEqual((attrs["camera"], attrs["context"]), ("front_door", "secure=true"))
+        self.assertEqual(results, [7])
+
 if __name__ == "__main__":
     unittest.main()

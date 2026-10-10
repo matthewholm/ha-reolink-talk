@@ -162,6 +162,33 @@ def ws_get_token(hass: HomeAssistant, connection: websocket_api.ActiveConnection
     )
 
 
+CLIENT_ERROR_ENTITY = "sensor.reolink_talk_last_client_error"
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "reolink_talk/client_error",
+        vol.Required("camera"): vol.All(str, vol.Length(max=64)),
+        vol.Required("message"): vol.All(str, vol.Length(max=500)),
+        vol.Optional("context", default=""): vol.All(str, vol.Length(max=500)),
+    }
+)
+@callback
+def ws_client_error(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """Record why the browser-side talk button failed.
+
+    The button runs on phones too, where nobody can open a console. The last
+    failure is logged and kept as the state of a diagnostic sensor.
+    """
+    _LOGGER.warning("Live talk client error: %s (%s)", msg["message"], msg["context"])
+    hass.states.async_set(
+        CLIENT_ERROR_ENTITY,
+        msg["message"][:255],
+        {"camera": msg["camera"], "context": msg["context"], "friendly_name": "Reolink Talk last client error"},
+    )
+    connection.send_result(msg["id"])
+
+
 class ReolinkTalkLiveWebSocketView(HomeAssistantView):
     """Accepts a live mic PCM stream and forwards it to the camera as talk audio."""
 
@@ -346,4 +373,5 @@ def async_register_views(hass: HomeAssistant) -> None:
     hass.data[key] = True
     hass.http.register_view(ReolinkTalkLiveWebSocketView())
     websocket_api.async_register_command(hass, ws_get_token)
+    websocket_api.async_register_command(hass, ws_client_error)
     _LOGGER.info("Registered reolink_talk live-talk WebSocket view at /api/reolink_talk/live_ws")
