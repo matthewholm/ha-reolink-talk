@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from homeassistant.components.http import StaticPathConfig
@@ -42,12 +43,26 @@ async def _async_register_lovelace_resource(hass: HomeAssistant) -> None:
         _LOGGER.debug("Lovelace resources unavailable, falling back to extra_js_url")
         return
 
+    # The file is served with a month-long cache header, so the URL carries a
+    # hash of its content: a changed button gets a new URL and every client,
+    # the companion app included, fetches it instead of running the old one.
+    url = f"{FRONTEND_URL}?v={await hass.async_add_executor_job(_frontend_hash, hass)}"
+
     for item in resources.async_items():
         if item.get("url", "").split("?")[0] == FRONTEND_URL:
+            if item["url"] != url:
+                await resources.async_update_item(item["id"], {"url": url})
+                _LOGGER.info("Updated Lovelace resource to %s", url)
             return
 
-    await resources.async_create_item({"res_type": "module", "url": FRONTEND_URL})
-    _LOGGER.info("Registered Lovelace resource %s", FRONTEND_URL)
+    await resources.async_create_item({"res_type": "module", "url": url})
+    _LOGGER.info("Registered Lovelace resource %s", url)
+
+
+def _frontend_hash(hass: HomeAssistant) -> str:
+    path = hass.config.path(f"custom_components/{DOMAIN}/{FRONTEND_FILE}")
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:12]
 
 
 async def _async_register_frontend(hass: HomeAssistant) -> None:
