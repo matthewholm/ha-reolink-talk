@@ -18,6 +18,11 @@ _LOGGER = logging.getLogger(__name__)
 
 BC_MESSAGE_CLASS_1464: Final[bytes] = bytes.fromhex("00001464")  # status_code=0, class=1464
 
+# reolink-aio 0.21.17 removed baichuan.xmls.XML_HEADER, which every talk block
+# was built on (issue #4). Kept here byte-for-byte so we no longer depend on a
+# private constant of the library HA's Reolink integration pins for us.
+BC_XML_HEADER: Final[str] = '<?xml version="1.0" encoding="UTF-8" ?>\n'
+
 
 @dataclass(frozen=True)
 class TalkAbility:
@@ -599,7 +604,6 @@ async def send_talk_binary(
     # - encrypts only the Extension XML
     # - appends the BcMedia binary payload unencrypted
     from reolink_aio.baichuan import util as bc_util
-    from reolink_aio.baichuan import xmls
 
     if not getattr(bc, "_logged_in", False):
         await bc.login()
@@ -613,7 +617,7 @@ async def send_talk_binary(
     ch_id = channel + 1
 
     ext = (
-        xmls.XML_HEADER
+        BC_XML_HEADER
         + '<Extension version="1.1">\n'
         + "<binaryData>1</binaryData>\n"
         + f"<channelId>{channel}</channelId>\n"

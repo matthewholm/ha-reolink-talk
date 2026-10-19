@@ -41,6 +41,8 @@ from typing import Final
 LOG = logging.getLogger("reolink_talk_debug")
 
 BC_MESSAGE_CLASS_1464: Final[bytes] = bytes.fromhex("00001464")  # status_code=0, class=1464
+# reolink-aio 0.21.17 removed baichuan.xmls.XML_HEADER; same bytes, kept locally.
+BC_XML_HEADER: Final[str] = '<?xml version="1.0" encoding="UTF-8" ?>\n'
 ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 
 
@@ -525,7 +527,6 @@ def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> by
 
 async def send_talk_binary(bc, *, channel: int, binary_payload: bytes, enc_type, mess_id: int | None = None) -> None:
     from reolink_aio.baichuan import util as bc_util
-    from reolink_aio.baichuan import xmls
     from Crypto.Cipher import AES
 
     if not getattr(bc, "_logged_in", False):
@@ -535,7 +536,7 @@ async def send_talk_binary(bc, *, channel: int, binary_payload: bytes, enc_type,
 
     ch_id = channel + 1
     ext = (
-        xmls.XML_HEADER
+        BC_XML_HEADER
         + '<Extension version="1.1">\n'
         + "<binaryData>1</binaryData>\n"
         + f"<channelId>{channel}</channelId>\n"
@@ -626,7 +627,6 @@ async def send_talk_binary_with_encryptlen(
     require this for talk payloads too.
     """
     from reolink_aio.baichuan import util as bc_util
-    from reolink_aio.baichuan import xmls
     from Crypto.Cipher import AES
 
     if not getattr(bc, "_logged_in", False):
@@ -638,7 +638,7 @@ async def send_talk_binary_with_encryptlen(
     encrypt_payload_len = max(0, min(int(encrypt_payload_len), len(binary_payload)))
 
     ext = (
-        xmls.XML_HEADER
+        BC_XML_HEADER
         + '<Extension version="1.1">\n'
         + "<binaryData>1</binaryData>\n"
         + f"<channelId>{channel}</channelId>\n"
