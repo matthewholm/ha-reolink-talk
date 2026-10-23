@@ -93,9 +93,38 @@ class ReolinkTalkButton extends HTMLElement {
 
   _failWith(message, err) {
     console.error("reolink-talk-button: " + message, err || "");
+    this._report(message, err);
     this._setVisualState("error");
     this._recording = false;
     setTimeout(() => this._setVisualState("idle"), 1500);
+  }
+
+  // A failure is otherwise visible only as a red flash, and a phone app has no
+  // console to read. Show the reason as a Home Assistant toast, and send it to
+  // the integration, which keeps the last one in
+  // sensor.reolink_talk_last_client_error.
+  _report(message, err) {
+    let detail = "";
+    if (err) {
+      detail = err.name || err.message ? (err.name || "Error") + ": " + (err.message || "") : String(err);
+    }
+    const text = "Reolink Talk (" + this._camera + "): " + message + (detail ? " - " + detail : "");
+    this.dispatchEvent(new CustomEvent("hass-notification", {
+      detail: { message: text }, bubbles: true, composed: true,
+    }));
+    try {
+      if (this._hass && this._hass.connection) {
+        this._hass.connection.sendMessagePromise({
+          type: "reolink_talk/client_error",
+          camera: String(this._camera).slice(0, 64),
+          message: text.slice(0, 500),
+          context: ("secure=" + window.isSecureContext + " mediaDevices=" + !!navigator.mediaDevices +
+                    " ua=" + navigator.userAgent).slice(0, 500),
+        }).catch(() => {});
+      }
+    } catch (e) {
+      // reporting must never break the button
+    }
   }
 
   // Ask Home Assistant -- over its own authenticated WebSocket connection --
@@ -166,9 +195,11 @@ class ReolinkTalkButton extends HTMLElement {
       this._setVisualState("error");
     };
 
-    this._ws.onclose = () => {
+    this._ws.onclose = (ev) => {
       this._teardownAudio();
       if (this._recording) {
+        this._report(this._wsReady ? "talk session closed" : "talk socket closed before ready",
+                     { name: "close " + ev.code, message: ev.reason || "" });
         this._setVisualState("error");
         setTimeout(() => this._setVisualState("idle"), 1200);
       }
